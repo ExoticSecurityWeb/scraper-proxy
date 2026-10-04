@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Navigateur de Proxy</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, sans-serif; background: #0e1018; color: #eaeaf2; padding: 14px; max-width: 760px; margin: auto; }
+  h1 { font-size: 22px; margin: 6px 0 2px; }
+  p.sub { margin: 0 0 14px; color: #9aa0b8; font-size: 14px; }
+  label { display: block; font-size: 13px; color: #9aa0b8; margin: 10px 0 4px; }
+  input, select, button { width: 100%; padding: 12px; border-radius: 10px; border: 1px solid #2a2f45; background: #171a28; color: #eaeaf2; font-size: 16px; }
+  button { background: #ff4fa3; border: 0; color: #fff; font-weight: 600; margin-top: 8px; }
+  button.alt { background: #2a2f45; }
+  button:disabled { opacity: .5; }
+  .row { display: flex; gap: 8px; } .row > * { flex: 1; }
+  .card { background: #171a28; border: 1px solid #2a2f45; border-radius: 12px; padding: 10px 12px; margin-top: 10px; font-size: 14px; word-break: break-word; }
+  .ok { border-left: 4px solid #57f287; } .ko { border-left: 4px solid #ed4245; }
+  code { background: #0e1018; padding: 1px 5px; border-radius: 5px; }
+  iframe { width: 100%; height: 70vh; border: 1px solid #2a2f45; border-radius: 12px; margin-top: 10px; background: #fff; }
+  .note { font-size: 12px; color: #9aa0b8; margin-top: 10px; }
+</style>
+</head>
+<body>
+<h1>📡 Bienvenue dans Navigateur de Proxy</h1>
+<p class="sub">Tu mets un site, tu vois si le proxy répond, et tu l'ouvres à travers lui. Seuls tes proxys en surveillance 👀 sont proposés.</p>
+
+<label for="url">Site</label>
+<input id="url" type="url" inputmode="url" placeholder="https://example.com" value="https://example.com">
+
+<label for="proxy">Proxy en surveillance</label>
+<select id="proxy"><option>Chargement…</option></select>
+
+<div class="row">
+  <button id="bTest">Tester ce proxy</button>
+  <button id="bOpen">Ouvrir</button>
+</div>
+<button class="alt" id="bAll">Tester avec 5 proxys en surveillance</button>
+
+<div id="out"></div>
+<iframe id="frame" sandbox="allow-scripts" hidden></iframe>
+<p class="note">Seul le HTML de la page passe par le proxy. Les images et le style se chargent directement. Ne saisis jamais de mot de passe ni de paiement à travers un proxy gratuit.</p>
+
+<script>
+const API = "https://miastar.vosprojets.workers.dev"; // ← l'URL de ton Worker
+const KEY = decodeURIComponent(location.hash.slice(1)); // optionnel : #LACLE
+
+const $ = (id) => document.getElementById(id);
+let proxies = [];
+
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+function card(html, ok) {
+  const d = document.createElement("div");
+  d.className = "card " + (ok === true ? "ok" : ok === false ? "ko" : "");
+  d.innerHTML = html;
+  $("out").prepend(d);
+}
+const sel = () => proxies[$("proxy").selectedIndex];
+const qs = (p, url) => `type=${p.type}&proxy=${encodeURIComponent(p.proxy)}&url=${encodeURIComponent(url)}&key=${encodeURIComponent(KEY)}`;
+
+async function init() {
+  try {
+    const d = await (await fetch(`${API}/api/proxies?key=${encodeURIComponent(KEY)}`)).json();
+    if (d.ok === false) throw new Error(d.error);
+    proxies = d;
+    $("proxy").innerHTML = proxies.length
+      ? proxies.map((p) => `<option>${p.type.toUpperCase()} · ${esc(p.proxy)}${p.ms ? " · " + p.ms + " ms" : ""}</option>`).join("")
+      : "<option>Aucun proxy en surveillance</option>";
+    if (!proxies.length) card("Aucun proxy en surveillance pour l'instant : clique sur <b>👀 Garder en surveillance</b> sous un proxy dans #ProxyScraper, puis recharge la page.", null);
+  } catch (e) {
+    $("proxy").innerHTML = "<option>Erreur de chargement</option>";
+    card(`❌ ${esc(e.message)}`, false);
+  }
+}
+
+async function test(p, url) {
+  return (await fetch(`${API}/api/test?${qs(p, url)}`)).json();
+}
+
+$("bTest").onclick = async () => {
+  const p = sel(); if (!p) return;
+  const url = $("url").value.trim();
+  $("bTest").disabled = true;
+  const d = await test(p, url).catch((e) => ({ ok: false, error: e.message }));
+  $("bTest").disabled = false;
+  card(d.ok
+    ? `✅ <code>${esc(p.proxy)}</code> répond : HTTP ${d.status} en ${d.ms} ms<br>Titre : ${esc(d.title || "—")}<br>${d.bytes} octets`
+    : `❌ <code>${esc(p.proxy)}</code> : ${esc(d.error)}`, d.ok);
+};
+
+$("bAll").onclick = async () => {
+  const url = $("url").value.trim();
+  const list = proxies.slice(0, 5);
+  if (!list.length) return;
+  $("bAll").disabled = true;
+  const res = await Promise.all(list.map((p) => test(p, url).catch((e) => ({ ok: false, error: e.message }))));
+  $("bAll").disabled = false;
+  card(list.map((p, i) => res[i].ok
+    ? `✅ ${p.type.toUpperCase()} <code>${esc(p.proxy)}</code> : HTTP ${res[i].status}, ${res[i].ms} ms`
+    : `❌ ${p.type.toUpperCase()} <code>${esc(p.proxy)}</code> : ${esc(res[i].error)}`).join("<br>"));
+};
+
+async function openUrl(url, hops = 0) {
+  const p = sel(); if (!p) return;
+  $("bOpen").disabled = true;
+  try {
+    const d = await (await fetch(`${API}/api/open?${qs(p, url)}`)).json();
+    if (!d.ok) return card(`❌ ${esc(d.error)}`, false);
+    if (d.location && d.status >= 300 && d.status < 400 && hops < 4) {
+      const next = new URL(d.location, url).href;
+      $("url").value = next;
+      return openUrl(next, hops + 1);
+    }
+    if (!d.html) return card(`ℹ️ HTTP ${d.status} en ${d.ms} ms, mais ce type de contenu (${esc(d.contentType)}) ne s'affiche pas ici.`, true);
+
+    const doc = new DOMParser().parseFromString(d.html, "text/html");
+    doc.querySelectorAll("script,iframe,object,embed,meta[http-equiv]").forEach((e) => e.remove());
+    const base = doc.createElement("base"); base.href = d.url; doc.head.prepend(base);
+    const s = doc.createElement("script");
+    s.textContent = 'document.addEventListener("click",function(e){var a=e.target.closest("a[href]");if(!a)return;e.preventDefault();parent.postMessage({go:a.href},"*")})';
+    doc.body.append(s);
+    $("frame").hidden = false;
+    $("frame").srcdoc = "<!doctype html>" + doc.documentElement.outerHTML;
+    card(`🌐 Ouvert via <code>${esc(p.proxy)}</code> : HTTP ${d.status} en ${d.ms} ms`, true);
+  } catch (e) {
+    card(`❌ ${esc(e.message)}`, false);
+  } finally {
+    $("bOpen").disabled = false;
+  }
+}
+
+$("bOpen").onclick = () => openUrl($("url").value.trim());
+window.addEventListener("message", (e) => {
+  if (e.source === $("frame").contentWindow && e.data && e.data.go) {
+    $("url").value = e.data.go;
+    openUrl(e.data.go);
+  }
+});
+
+init();
+</script>
+</body>
+</html>
