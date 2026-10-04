@@ -1,16 +1,18 @@
-// MiaStar — bot Discord (Worker + Durable Object, connecté en permanence).
-// Lit les proxys déjà testés par le repo ExoticSecurityWeb/scraper-proxy, notifie, boutons, surveillance.
+// MiaStar — bot Discord (Worker + Durable Object, connecté en permanence)
+// + API du Navigateur de Proxy : seulement les proxys mis en surveillance (👀).
 import { DurableObject } from "cloudflare:workers";
+import { connect } from "cloudflare:sockets";
 
 const API = "https://discord.com/api/v10";
 const LIST_URL = "https://raw.githubusercontent.com/ExoticSecurityWeb/scraper-proxy/main/proxies/proxies.json";
 const TICK_MS = 60_000;
-const FETCH_EVERY = 5 * 60_000;   // relit ton repo toutes les 5 min
+const FETCH_EVERY = 5 * 60_000;
 const NOTIF_PER_HOUR = 6;
 const MAX_PER_TICK = 3;
-const DEAD_AFTER = 2;             // absent de 2 listes de suite = mort
+const DEAD_AFTER = 2;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const concat = (a, b) => { const o = new Uint8Array(a.length + b.length); o.set(a); o.set(b, a.length); return o; };
 const flag = (cc) =>
   cc ? String.fromCodePoint(...[...cc.toUpperCase()].map((c) => 127397 + c.charCodeAt(0))) : "🏳️";
 
@@ -79,9 +81,13 @@ export class MiaStar extends DurableObject {
   }
   async save() { await this.ctx.storage.put("s", this.s); }
 
-  async fetch() {
-    await this.wake();
+  async fetch(req) {
     const s = await this.load();
+    // Liste des proxys en surveillance (utilisée par le Navigateur de Proxy)
+    if (req && new URL(req.url).pathname === "/watchlist") {
+      return Response.json(Object.values(s.watch).map((w) => ({ type: w.type, proxy: w.proxy, ms: w.ms ?? null })));
+    }
+    await this.wake();
     return Response.json({
       miastar: "ok",
       gateway: !!this.ws,
@@ -245,7 +251,6 @@ export class MiaStar extends DurableObject {
       const s = await this.load();
       const now = Date.now();
 
-      // 1) Relire proxies.json du repo (si pas déjà fait récemment)
       if (now - s.lastFetch > FETCH_EVERY) {
         s.lastFetch = now;
         let json = null;
@@ -256,15 +261,14 @@ export class MiaStar extends DurableObject {
 
         if (json && json.updated !== s.updated) {
           s.updated = json.updated;
-          const current = new Map(); // "type|ip:port" -> ms
+          const current = new Map();
           for (const type of ["http", "socks4", "socks5"]) {
             for (const a of json[type] || []) current.set(`${type}|${a.proxy}`, a.ms);
           }
           s.total = current.size;
 
-          // Surveillance : absent de la liste = probablement mort
           for (const [key, w] of Object.entries(s.watch)) {
-            if (current.has(key)) { w.fails = 0; continue; }
+            if (current.has(key)) { w.fails = 0; w.ms = current.get(key); continue; }
             w.fails = (w.fails || 0) + 1;
             if (w.fails >= DEAD_AFTER) {
               delete s.watch[key];
@@ -278,7 +282,6 @@ export class MiaStar extends DurableObject {
             }
           }
 
-          // Nouveaux proxys à proposer
           s.alive = s.alive.filter((a) => current.has(`${a.type}|${a.proxy}`));
           for (const [key, ms] of current) {
             if (s.seen[key] || s.watch[key]) continue;
@@ -291,7 +294,6 @@ export class MiaStar extends DurableObject {
         }
       }
 
-      // 2) Notifs (6 max par heure)
       s.notifs = s.notifs.filter((t) => now - t < 3600_000);
       let allowed = Math.max(0, NOTIF_PER_HOUR - s.notifs.length);
       if (force) allowed = Math.max(allowed, 1);
@@ -317,10 +319,195 @@ export class MiaStar extends DurableObject {
   }
 }
 
-// ---------- Worker : sert juste à réveiller MiaStar ----------
+// =====================================================================
+// API du Navigateur de Proxy : seulement les proxys en surveillance (👀),
+// sur n'importe quel site (http/https).
+// Option : si tu crées un secret NAV_KEY, il faut ajouter #LACLE au lien.
+// =====================================================================
+const CORS = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "*" };
+const MAX_BODY = 600_000;
+
+async function resolve4(host) {
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) return host;
+  const j = await (await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(host)}&type=A`, {
+    headers: { accept: "application/dns-json" },
+  })).json();
+  const ip = j.Answer?.find((a) => a.type === 1)?.data;
+  if (!ip) throw new Error("DNS introuvable");
+  return ip;
+}
+
+function dechunk(b) {
+  const parts = [];
+  const dec = new TextDecoder();
+  let i = 0;
+  while (i < b.length) {
+    let j = i;
+    while (j < b.length - 1 && !(b[j] === 13 && b[j + 1] === 10)) j++;
+    const size = parseInt(dec.decode(b.slice(i, j)).split(";")[0].trim(), 16);
+    if (!size) break;
+    i = j + 2;
+    parts.push(b.slice(i, i + size));
+    i += size + 2;
+  }
+  return parts.reduce((acc, p) => concat(acc, p), new Uint8Array(0));
+}
+
+// Fait un GET de `target` à travers le proxy (http, socks4 ou socks5)
+async function viaProxy(type, proxy, target) {
+  const u = new URL(target);
+  const https = u.protocol === "https:";
+  const host = u.hostname;
+  const port = u.port ? +u.port : https ? 443 : 80;
+  const [ph, pp] = proxy.split(":");
+  const enc = new TextEncoder();
+  const dec = new TextDecoder();
+  const socket = connect({ hostname: ph, port: +pp }, { secureTransport: https ? "starttls" : "off" });
+  const timer = new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 12_000));
+
+  const job = (async () => {
+    let w = socket.writable.getWriter();
+    let r = socket.readable.getReader();
+    let buf = new Uint8Array(0);
+    const fill = async () => {
+      const { value, done } = await r.read();
+      if (done) return false;
+      buf = concat(buf, value);
+      return true;
+    };
+    const need = async (n) => { while (buf.length < n) if (!(await fill())) throw new Error("connexion fermée"); };
+    const take = (n) => { const o = buf.slice(0, n); buf = buf.slice(n); return o; };
+    const headEnd = (b) => {
+      for (let i = 0; i < b.length - 3; i++) if (b[i] === 13 && b[i + 1] === 10 && b[i + 2] === 13 && b[i + 3] === 10) return i + 4;
+      return -1;
+    };
+
+    // 1) Tunnel via le proxy
+    if (type === "http") {
+      if (https) {
+        await w.write(enc.encode(`CONNECT ${host}:${port} HTTP/1.1\r\nHost: ${host}:${port}\r\n\r\n`));
+        let he;
+        while ((he = headEnd(buf)) < 0) if (!(await fill())) throw new Error("connexion fermée");
+        if (!/^HTTP\/1\.[01] 200/.test(dec.decode(take(he)))) throw new Error("ce proxy refuse le HTTPS (CONNECT)");
+      }
+    } else if (type === "socks5") {
+      await w.write(new Uint8Array([5, 1, 0]));
+      await need(2);
+      const a = take(2);
+      if (a[0] !== 5 || a[1] !== 0) throw new Error("socks5 refusé");
+      const dom = enc.encode(host);
+      await w.write(new Uint8Array([5, 1, 0, 3, dom.length, ...dom, (port >> 8) & 255, port & 255]));
+      await need(4);
+      const h = take(4);
+      if (h[1] !== 0) throw new Error("socks5 : connexion impossible");
+      if (h[3] === 3) { await need(1); const l = take(1)[0]; await need(l + 2); take(l + 2); }
+      else { const n = h[3] === 4 ? 16 : 4; await need(n + 2); take(n + 2); }
+    } else {
+      const ip = await resolve4(host);
+      await w.write(new Uint8Array([4, 1, (port >> 8) & 255, port & 255, ...ip.split(".").map(Number), 0]));
+      await need(8);
+      if (take(8)[1] !== 90) throw new Error("socks4 : connexion impossible");
+    }
+
+    // 2) TLS par-dessus le tunnel si HTTPS
+    if (https) {
+      w.releaseLock();
+      r.releaseLock();
+      const tls = socket.startTls({ expectedServerHostname: host });
+      w = tls.writable.getWriter();
+      r = tls.readable.getReader();
+      buf = new Uint8Array(0);
+    }
+
+    // 3) La requête
+    const line = type === "http" && !https ? u.href : u.pathname + u.search;
+    await w.write(enc.encode(
+      `GET ${line} HTTP/1.1\r\nHost: ${u.host}\r\nUser-Agent: Mozilla/5.0 (compatible; MiaStar)\r\n` +
+      `Accept: text/html,*/*\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n`
+    ));
+
+    // 4) La réponse
+    let he;
+    while ((he = headEnd(buf)) < 0) {
+      if (!(await fill())) throw new Error("réponse vide");
+      if (buf.length > 65_536 && headEnd(buf) < 0) throw new Error("réponse invalide");
+    }
+    const head = dec.decode(buf.slice(0, he));
+    const m = head.match(/^HTTP\/1\.[01] (\d{3})/);
+    if (!m) throw new Error("ce n'est pas du HTTP");
+    const headers = {};
+    for (const l of head.split("\r\n").slice(1)) {
+      const k = l.indexOf(":");
+      if (k > 0) headers[l.slice(0, k).trim().toLowerCase()] = l.slice(k + 1).trim();
+    }
+    buf = buf.slice(he);
+    while (buf.length < MAX_BODY && (await fill())) {}
+    const body = /chunked/i.test(headers["transfer-encoding"] || "") ? dechunk(buf) : buf;
+    return { status: +m[1], headers, body };
+  })();
+
+  try {
+    return await Promise.race([job, timer]);
+  } finally {
+    try { socket.close(); } catch {}
+  }
+}
+
+async function navApi(url, env) {
+  const json = (o, s = 200) => Response.json(o, { status: s, headers: CORS });
+
+  if (env.NAV_KEY && url.searchParams.get("key") !== env.NAV_KEY) {
+    return json({ ok: false, error: "Clé manquante : ajoute #LACLE à la fin du lien de la page" }, 403);
+  }
+
+  const watch = await (await star(env).fetch("https://miastar/watchlist")).json();
+  if (url.pathname === "/api/proxies") return json(watch);
+
+  const type = url.searchParams.get("type");
+  const proxy = url.searchParams.get("proxy");
+  let u;
+  try { u = new URL(url.searchParams.get("url")); } catch { return json({ ok: false, error: "URL invalide" }, 400); }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return json({ ok: false, error: "Seulement http ou https" }, 400);
+  if (u.port && u.port !== "80" && u.port !== "443") return json({ ok: false, error: "Seulement les ports 80 et 443" }, 400);
+  if (!watch.some((w) => w.type === type && w.proxy === proxy)) {
+    return json({ ok: false, error: "Ce proxy n'est pas en surveillance (👀)" }, 403);
+  }
+
+  const start = Date.now();
+  try {
+    const r = await viaProxy(type, proxy, u.href);
+    const ms = Date.now() - start;
+    const ct = r.headers["content-type"] || "";
+    const text = /text\/|json|xml/.test(ct) ? new TextDecoder().decode(r.body) : "";
+    if (url.pathname === "/api/test") {
+      const title = (text.match(/<title[^>]*>([^<]{0,120})/i) || [])[1]?.trim() || null;
+      return json({ ok: true, status: r.status, ms, title, bytes: r.body.length, contentType: ct });
+    }
+    return json({
+      ok: true,
+      status: r.status,
+      ms,
+      url: u.href,
+      location: r.headers.location || null,
+      contentType: ct,
+      html: /text\/html/.test(ct) ? text : null,
+    });
+  } catch (e) {
+    return json({ ok: false, error: e.message, ms: Date.now() - start });
+  }
+}
+
+// ---------- Worker ----------
 const star = (env) => env.STAR.get(env.STAR.idFromName("main"));
 
 export default {
-  fetch: (req, env) => star(env).fetch(req),
+  async fetch(req, env) {
+    const url = new URL(req.url);
+    if (req.method === "OPTIONS") return new Response(null, { headers: CORS });
+    if (url.pathname === "/api/proxies" || url.pathname === "/api/test" || url.pathname === "/api/open") {
+      return navApi(url, env);
+    }
+    return star(env).fetch(req);
+  },
   scheduled: (_e, env, ctx) => ctx.waitUntil(star(env).fetch("https://miastar/wake")),
 };
