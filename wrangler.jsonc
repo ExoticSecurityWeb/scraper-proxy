@@ -1,0 +1,10 @@
+{
+  "name": "miastar",
+  "main": "worker.js",
+  "compatibility_date": "2025-09-01",
+  "durable_objects": {
+    "bindings": [{ "name": "STAR", "class_name": "MiaStar" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["MiaStar"] }],
+  "triggers": { "crons": ["*/5 * * * *"] }
+}
